@@ -60,67 +60,132 @@ export function ImageConverter() {
   )
 
   const convertImage = async (file: File, imageId: string) => {
-    try {
-      setIsConverting(true)
+    const maxRetries = 3
+    let retryCount = 0
 
-      const webhookUrl = process.env.NEXT_PUBLIC_N8N_WEBHOOK_URL
-
-      if (!webhookUrl) {
-        throw new Error("Webhook URL não configurada. Configure a variável NEXT_PUBLIC_N8N_WEBHOOK_URL.")
-      }
-
+    const attemptConversion = async (): Promise<void> => {
       try {
-        new URL(webhookUrl)
-      } catch {
-        throw new Error("URL do webhook inválida. Verifique se a URL está no formato correto (ex: https://...)")
-      }
+        setIsConverting(true)
 
-      setImages((prev) => prev.map((img) => (img.id === imageId ? { ...img, status: "converting" as const } : img)))
+        const webhookUrl = process.env.NEXT_PUBLIC_N8N_WEBHOOK_URL
 
-      for (let progress = 0; progress <= 100; progress += 10) {
-        await new Promise((resolve) => setTimeout(resolve, 100))
-        setImages((prev) => prev.map((img) => (img.id === imageId ? { ...img, progress } : img)))
-      }
+        if (!webhookUrl) {
+          throw new Error("Webhook URL não configurada. Configure a variável NEXT_PUBLIC_N8N_WEBHOOK_URL.")
+        }
 
-      const formData = new FormData()
-      formData.append("image", file)
-      formData.append("format", "avif")
-      formData.append("quality", "80")
+        try {
+          new URL(webhookUrl)
+        } catch {
+          throw new Error("URL do webhook inválida. Verifique se a URL está no formato correto (ex: https://...)")
+        }
 
-      console.log("[v0] Enviando para webhook:", webhookUrl)
-      console.log("[v0] Arquivo:", file.name, "Tamanho:", file.size)
+        setImages((prev) => prev.map((img) => (img.id === imageId ? { ...img, status: "converting" as const } : img)))
 
-      const response = await fetch(webhookUrl, {
-        method: "POST",
-        body: formData,
-      })
+        for (let progress = 0; progress <= 100; progress += 10) {
+          await new Promise((resolve) => setTimeout(resolve, 100))
+          setImages((prev) => prev.map((img) => (img.id === imageId ? { ...img, progress } : img)))
+        }
 
-      console.log("[v0] Resposta do webhook:", response.status, response.statusText)
+        const formData = new FormData()
+        formData.append("image", file)
+        formData.append("format", "avif")
+        formData.append("quality", "80")
 
-      if (!response.ok) {
-        const errorText = await response.text().catch(() => "Erro desconhecido")
-        throw new Error(`Erro na conversão (${response.status}): ${errorText}`)
-      }
+        console.log("[v0] Enviando para webhook:", webhookUrl)
+        console.log("[v0] Arquivo:", file.name, "Tamanho:", file.size)
 
-      let result
-      try {
-        const responseText = await response.text()
-        console.log("[v0] Resposta bruta:", responseText)
+        const controller = new AbortController()
+        const timeoutId = setTimeout(() => controller.abort(), 60000) // 60 segundos timeout
 
-        if (!responseText || responseText.trim() === "") {
-          console.log("[v0] Resposta vazia detectada - webhook não configurado para retornar dados")
+        let response: Response
+        try {
+          response = await fetch(webhookUrl, {
+            method: "POST",
+            body: formData,
+            signal: controller.signal,
+            headers: {
+              // Não definir Content-Type para FormData - deixar o browser definir com boundary
+            },
+          })
+        } catch (fetchError: any) {
+          clearTimeout(timeoutId)
+
+          // Detectar tipo específico de erro
+          if (fetchError.name === "AbortError") {
+            throw new Error(
+              `Timeout: A conversão demorou mais de 60 segundos. Tente com uma imagem menor ou verifique a conexão.`,
+            )
+          } else if (fetchError.message?.includes("Failed to fetch") || fetchError.message?.includes("Load failed")) {
+            throw new Error(
+              `Erro de conexão: Não foi possível conectar ao servidor. Verifique se o webhook está funcionando e acessível.`,
+            )
+          } else if (fetchError.message?.includes("CORS")) {
+            throw new Error(`Erro CORS: O servidor não permite requisições desta origem. Configure CORS no webhook.`)
+          } else {
+            throw new Error(`Erro de rede: ${fetchError.message || "Falha na conexão"}`)
+          }
+        }
+
+        clearTimeout(timeoutId)
+        console.log("[v0] Resposta do webhook:", response.status, response.statusText)
+
+        if (!response.ok) {
+          const errorText = await response.text().catch(() => "Erro desconhecido")
+
+          // Mensagens específicas por código de status
+          if (response.status === 413) {
+            throw new Error(
+              `Arquivo muito grande (${response.status}): O servidor não aceita arquivos deste tamanho. Tente com uma imagem menor.`,
+            )
+          } else if (response.status === 429) {
+            throw new Error(`Muitas requisições (${response.status}): Aguarde um momento antes de tentar novamente.`)
+          } else if (response.status >= 500) {
+            throw new Error(
+              `Erro do servidor (${response.status}): O webhook está com problemas. Tente novamente em alguns minutos.`,
+            )
+          } else {
+            throw new Error(`Erro na conversão (${response.status}): ${errorText}`)
+          }
+        }
+
+        let result
+        try {
+          const responseText = await response.text()
+          console.log("[v0] Resposta bruta:", responseText)
+
+          if (!responseText || responseText.trim() === "") {
+            console.log("[v0] Resposta vazia detectada - webhook não configurado para retornar dados")
+
+            setImages((prev) =>
+              prev.map((img) =>
+                img.id === imageId
+                  ? {
+                      ...img,
+                      status: "completed" as const,
+                      convertedUrl: null,
+                      convertedSize: Math.floor(file.size * 0.6), // Estimativa
+                      progress: 100,
+                      error:
+                        "Webhook processou mas não retornou URL de download. Configure o fluxo n8n para retornar JSON com a URL.",
+                    }
+                  : img,
+              ),
+            )
+            return
+          }
+
+          result = JSON.parse(responseText)
+          console.log("[v0] JSON parseado:", result)
+        } catch (parseError) {
+          console.error("[v0] Erro ao parsear JSON:", parseError)
 
           setImages((prev) =>
             prev.map((img) =>
               img.id === imageId
                 ? {
                     ...img,
-                    status: "completed" as const,
-                    convertedUrl: null,
-                    convertedSize: Math.floor(file.size * 0.6), // Estimativa
-                    progress: 100,
-                    error:
-                      "Webhook processou mas não retornou URL de download. Configure o fluxo n8n para retornar JSON com a URL.",
+                    status: "error" as const,
+                    error: "Resposta inválida do webhook. Verifique se o webhook retorna JSON válido.",
                   }
                 : img,
             ),
@@ -128,97 +193,114 @@ export function ImageConverter() {
           return
         }
 
-        result = JSON.parse(responseText)
-        console.log("[v0] JSON parseado:", result)
-      } catch (parseError) {
-        console.error("[v0] Erro ao parsear JSON:", parseError)
+        let processedResult = result
+
+        if (Array.isArray(result) && result.length > 0) {
+          processedResult = result[0]
+          console.log("[v0] Array detectado, usando primeiro item:", processedResult)
+        }
+
+        if (!processedResult || typeof processedResult !== "object") {
+          setImages((prev) =>
+            prev.map((img) =>
+              img.id === imageId
+                ? {
+                    ...img,
+                    status: "error" as const,
+                    error: "Formato de resposta inválido do webhook",
+                  }
+                : img,
+            ),
+          )
+          return
+        }
+
+        const downloadUrl =
+          processedResult.secure_url ||
+          processedResult.url ||
+          processedResult.downloadUrl ||
+          processedResult.file_url ||
+          processedResult.download_url ||
+          processedResult.public_url ||
+          processedResult.link ||
+          processedResult.href ||
+          (processedResult.data &&
+            (processedResult.data.url || processedResult.data.downloadUrl || processedResult.data.file_url)) ||
+          (processedResult.file && (processedResult.file.url || processedResult.file.downloadUrl)) ||
+          null
+
+        console.log("[v0] URL detectada:", downloadUrl)
+        console.log("[v0] Campos disponíveis no resultado:", Object.keys(processedResult))
 
         setImages((prev) =>
           prev.map((img) =>
             img.id === imageId
               ? {
                   ...img,
-                  status: "error" as const,
-                  error: "Resposta inválida do webhook. Verifique se o webhook retorna JSON válido.",
+                  status: "completed" as const,
+                  convertedUrl: downloadUrl,
+                  convertedSize:
+                    processedResult.bytes ||
+                    processedResult.size ||
+                    processedResult.file_size ||
+                    Math.floor(file.size * 0.6),
+                  progress: 100,
                 }
               : img,
           ),
         )
-        return
-      }
+      } catch (error) {
+        console.error("[v0] Erro na conversão:", error)
 
-      let processedResult = result
+        const errorMessage = error instanceof Error ? error.message : "Erro desconhecido na conversão"
 
-      if (Array.isArray(result) && result.length > 0) {
-        processedResult = result[0]
-        console.log("[v0] Array detectado, usando primeiro item:", processedResult)
-      }
+        // Verificar se é um erro que vale a pena tentar novamente
+        const isRetryableError =
+          errorMessage.includes("Erro de conexão") ||
+          errorMessage.includes("Erro do servidor") ||
+          errorMessage.includes("Timeout") ||
+          errorMessage.includes("Failed to fetch")
 
-      if (!processedResult || typeof processedResult !== "object") {
+        if (isRetryableError && retryCount < maxRetries) {
+          retryCount++
+          console.log(`[v0] Tentativa ${retryCount}/${maxRetries} em 2 segundos...`)
+
+          setImages((prev) =>
+            prev.map((img) =>
+              img.id === imageId
+                ? {
+                    ...img,
+                    status: "converting" as const,
+                    error: `Tentativa ${retryCount}/${maxRetries}... ${errorMessage}`,
+                  }
+                : img,
+            ),
+          )
+
+          // Aguardar 2 segundos antes de tentar novamente
+          await new Promise((resolve) => setTimeout(resolve, 2000))
+          return attemptConversion()
+        }
+
+        // Se chegou aqui, falhou definitivamente
         setImages((prev) =>
           prev.map((img) =>
             img.id === imageId
               ? {
                   ...img,
                   status: "error" as const,
-                  error: "Formato de resposta inválido do webhook",
+                  error: retryCount > 0 ? `Falhou após ${retryCount} tentativas: ${errorMessage}` : errorMessage,
                 }
               : img,
           ),
         )
-        return
+      } finally {
+        setIsConverting(false)
       }
-
-      const downloadUrl =
-        processedResult.secure_url ||
-        processedResult.url ||
-        processedResult.downloadUrl ||
-        processedResult.file_url ||
-        processedResult.download_url ||
-        processedResult.public_url ||
-        processedResult.link ||
-        processedResult.href ||
-        (processedResult.data &&
-          (processedResult.data.url || processedResult.data.downloadUrl || processedResult.data.file_url)) ||
-        (processedResult.file && (processedResult.file.url || processedResult.file.downloadUrl)) ||
-        null
-
-      console.log("[v0] URL detectada:", downloadUrl)
-      console.log("[v0] Campos disponíveis no resultado:", Object.keys(processedResult))
-
-      setImages((prev) =>
-        prev.map((img) =>
-          img.id === imageId
-            ? {
-                ...img,
-                status: "completed" as const,
-                convertedUrl: downloadUrl,
-                convertedSize:
-                  processedResult.bytes ||
-                  processedResult.size ||
-                  processedResult.file_size ||
-                  Math.floor(file.size * 0.6),
-                progress: 100,
-              }
-            : img,
-        ),
-      )
-    } catch (error) {
-      console.error("[v0] Erro na conversão:", error)
-      setImages((prev) =>
-        prev.map((img) =>
-          img.id === imageId
-            ? {
-                ...img,
-                status: "error" as const,
-                error: error instanceof Error ? error.message : "Erro desconhecido na conversão",
-              }
-            : img,
-        ),
-      )
-    } finally {
-      setIsConverting(false)
     }
+
+    // Iniciar a primeira tentativa
+    return attemptConversion()
   }
 
   const removeImage = (imageId: string) => {
