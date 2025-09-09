@@ -351,7 +351,7 @@ export function ImageConverter() {
               !isConfigured && "opacity-50 cursor-not-allowed",
               isDragActive && isConfigured
                 ? "border-primary bg-primary/5"
-                : "border-border hover:border-primary/50 hover:bg-muted/50",
+                : "border-gray-200 hover:border-primary/50 hover:bg-muted/50",
             )}
           >
             <input {...getInputProps()} />
